@@ -6,24 +6,60 @@
 <meta name="robots" content="noindex, nofollow">
 <title>打开监测</title>
 <style>
-  body { margin:0; min-height:100vh; display:grid; place-items:center; background:#12151c; color:#e7ecf5; font:16px/1.4 Georgia, serif; }
-  form { width:min(360px, calc(100% - 32px)); display:grid; gap:10px; }
-  input, button { font:inherit; padding:10px 12px; border-radius:10px; border:1px solid #2c3548; }
-  input { background:#1c2230; color:inherit; }
-  button { background:#d7c4a3; color:#1c2230; }
-  p { min-height:1.4em; color:#e6c27a; }
+  body {
+    margin: 0; min-height: 100vh; display: grid; place-items: center;
+    background: #12151c; color: #e7ecf5; font: 16px/1.4 Georgia, serif;
+    color-scheme: dark; -webkit-text-size-adjust: 100%;
+  }
+  form { width: min(360px, calc(100% - 32px)); display: grid; gap: 10px; }
+  label { display: block; }
+  input[type="password"], button {
+    font: inherit; padding: 10px 12px; border-radius: 10px; border: 1px solid #2c3548; width: 100%;
+  }
+  input[type="password"] { background: #1c2230; color: inherit; }
+  button { background: #d7c4a3; color: #1c2230; }
+  button:disabled { opacity: 0.55; }
+  button.ghost { background: transparent; color: #e7ecf5; }
+  .remember { display: flex; align-items: center; gap: 8px; color: #93a0b8; font-size: 14px; }
+  .remember input { width: 18px; height: 18px; margin: 0; accent-color: #d7c4a3; }
+  p { min-height: 1.4em; margin: 0; color: #e6c27a; }
 </style>
 </head>
 <body>
-<form id="gate">
+<form id="gate" method="post" action="#" autocomplete="on">
   <label for="pass">口令</label>
-  <input id="pass" type="password" autocomplete="current-password" required>
-  <button type="submit">打开</button>
-  <p id="msg"></p>
+  <input id="pass" name="password" type="password" autocomplete="current-password" enterkeyhint="go" autocapitalize="off" autocorrect="off" spellcheck="false" required>
+  <label class="remember"><input id="remember" type="checkbox"><span>在本机记住</span></label>
+  <button type="submit" id="open">打开</button>
+  <button type="button" id="retry" class="ghost" hidden>重试</button>
+  <p id="msg" role="status"></p>
 </form>
 <script>
 const ITERATIONS = 600000;
-const STORE = "arisk-session-key";
+const SESSION_KEY = "arisk-session-key";
+const DEVICE_KEY = "arisk-device-key";
+const REMEMBER_FLAG = "arisk-remember";
+const LOAD_FAIL = "加密包加载失败，请重试。不要在微信内置浏览器里打开这个页面。";
+const RETRIES = 2;
+
+function hexToBytes(hex) {
+  const out = new Uint8Array(hex.length / 2);
+  for (let i = 0; i < out.length; i++) out[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16);
+  return out;
+}
+// 与 publish.py 的 MASTER_SALT 相同。不是口令。提交后立刻用它派生，不必等包下完。
+const MASTER_SALT = hexToBytes("707282bfd5af4e47c80cf841533fe75a");
+
+const form = document.getElementById("gate");
+const passEl = document.getElementById("pass");
+const openBtn = document.getElementById("open");
+const retryBtn = document.getElementById("retry");
+const rememberEl = document.getElementById("remember");
+const msgEl = document.getElementById("msg");
+
+let busy = false;
+let payloadTask = null;
+let resumeSaved = null;
 
 function b64(bytes) {
   let s = "";
@@ -36,6 +72,51 @@ function unb64(text) {
   for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
   return out;
 }
+function sameBytes(a, b) {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+  return true;
+}
+function sleep(ms) {
+  return new Promise(resolve => { setTimeout(resolve, ms); });
+}
+class PayloadError extends Error {
+  constructor(kind) {
+    super(kind);
+    this.name = "PayloadError";
+  }
+}
+
+function onSubmit(event) {
+  event.preventDefault();
+  if (busy || !passEl.value) return;
+  unlock(passEl.value, rememberEl.checked, false);
+}
+function onRetry() {
+  if (busy) return;
+  if (passEl.value) {
+    unlock(passEl.value, rememberEl.checked, true);
+    return;
+  }
+  if (resumeSaved) {
+    openSaved(resumeSaved, true);
+    return;
+  }
+  busy = true;
+  openBtn.disabled = true;
+  retryBtn.hidden = true;
+  msgEl.textContent = "正在加载加密包…";
+  loadPayload(true).then(() => {
+    msgEl.textContent = "加密包已就绪";
+    busy = false;
+    openBtn.disabled = false;
+  }).catch(() => { showLoadError(); });
+}
+
+// 单字段表单按回车会隐式提交。监听必须在任何 await 之前装上，否则点「打开」会整页刷新并清掉口令。
+form.addEventListener("submit", onSubmit);
+retryBtn.addEventListener("click", onRetry);
+
 async function derive(pass, salt) {
   const base = await crypto.subtle.importKey("raw", new TextEncoder().encode(pass), "PBKDF2", false, ["deriveKey"]);
   return crypto.subtle.deriveKey(
@@ -46,45 +127,161 @@ async function derive(pass, salt) {
     ["decrypt"]
   );
 }
-async function openWithKey(raw, key) {
-  const salt = raw.slice(0, 16);
+async function decryptHtml(raw, key) {
   const iv = raw.slice(16, 28);
   const body = raw.slice(28);
   const plain = await crypto.subtle.decrypt({ name: "AES-GCM", iv }, key, body);
-  const html = new TextDecoder().decode(plain);
-  sessionStorage.setItem(STORE, b64(new Uint8Array(await crypto.subtle.exportKey("raw", key))));
+  return new TextDecoder().decode(plain);
+}
+async function persist(key, remember, updateDevice) {
+  const exported = b64(new Uint8Array(await crypto.subtle.exportKey("raw", key)));
+  try { sessionStorage.setItem(SESSION_KEY, exported); } catch (err) { /* 隐私模式可能拒绝 */ }
+  if (!updateDevice) return;
+  try {
+    if (remember) {
+      localStorage.setItem(DEVICE_KEY, exported);
+      localStorage.setItem(REMEMBER_FLAG, "1");
+    } else {
+      localStorage.removeItem(DEVICE_KEY);
+      localStorage.removeItem(REMEMBER_FLAG);
+    }
+  } catch (err) { /* 记不住时仍可进入，本次会话用 sessionStorage */ }
+}
+async function finish(raw, key, remember, updateDevice) {
+  const html = await decryptHtml(raw, key);
+  try { await persist(key, remember, updateDevice); } catch (err) { /* 解密已成功，存储失败不挡进入 */ }
   document.open();
   document.write(html);
   document.close();
-  return salt;
 }
-async function boot() {
-  const res = await fetch("./payload.enc", { cache: "no-store" });
-  if (!res.ok) throw new Error("没有加密包");
-  const raw = new Uint8Array(await res.arrayBuffer());
-  const saved = sessionStorage.getItem(STORE);
-  if (saved) {
+async function fetchOnce() {
+  let res;
+  try {
+    res = await fetch("./payload.enc", { cache: "no-store" });
+  } catch (err) {
+    throw new PayloadError("net");
+  }
+  if (!res.ok) throw new PayloadError("http");
+  let buf;
+  try {
+    buf = await res.arrayBuffer();
+  } catch (err) {
+    throw new PayloadError("net");
+  }
+  const raw = new Uint8Array(buf);
+  if (raw.byteLength < 28) throw new PayloadError("short");
+  return raw;
+}
+async function fetchPayload() {
+  let last = null;
+  for (let attempt = 0; attempt <= RETRIES; attempt++) {
     try {
-      const key = await crypto.subtle.importKey("raw", unb64(saved), "AES-GCM", false, ["decrypt"]);
-      await openWithKey(raw, key);
-      return;
+      return await fetchOnce();
     } catch (err) {
-      sessionStorage.removeItem(STORE);
+      last = err;
+      if (attempt < RETRIES) await sleep(400 * (attempt + 1));
     }
   }
-  document.getElementById("gate").addEventListener("submit", async (event) => {
-    event.preventDefault();
-    const msg = document.getElementById("msg");
-    msg.textContent = "正在打开…";
-    try {
-      const key = await derive(document.getElementById("pass").value, raw.slice(0, 16));
-      await openWithKey(raw, key);
-    } catch (err) {
-      msg.textContent = "口令不对";
-    }
-  });
+  if (last instanceof PayloadError) throw last;
+  throw new PayloadError("net");
 }
-boot().catch(err => { document.getElementById("msg").textContent = String(err.message || err); });
+function loadPayload(force) {
+  if (force || !payloadTask) {
+    const task = fetchPayload().then(
+      raw => raw,
+      err => {
+        if (payloadTask === task) payloadTask = null;
+        throw err;
+      }
+    );
+    payloadTask = task;
+  }
+  return payloadTask;
+}
+function showLoadError() {
+  busy = false;
+  openBtn.disabled = false;
+  retryBtn.hidden = false;
+  msgEl.textContent = LOAD_FAIL;
+}
+function clearSaved() {
+  resumeSaved = null;
+  try { sessionStorage.removeItem(SESSION_KEY); } catch (err) { /* 忽略 */ }
+  try {
+    localStorage.removeItem(DEVICE_KEY);
+    localStorage.removeItem(REMEMBER_FLAG);
+  } catch (err) { /* 忽略 */ }
+}
+function readSaved() {
+  try {
+    if (localStorage.getItem(REMEMBER_FLAG) === "1") {
+      const encoded = localStorage.getItem(DEVICE_KEY);
+      if (encoded) return { encoded, remember: true };
+    }
+  } catch (err) { /* 没有 localStorage 就只看会话 */ }
+  try {
+    const encoded = sessionStorage.getItem(SESSION_KEY);
+    if (encoded) return { encoded, remember: false };
+  } catch (err) { /* 忽略 */ }
+  return null;
+}
+async function unlock(pass, remember, force) {
+  busy = true;
+  openBtn.disabled = true;
+  retryBtn.hidden = true;
+  msgEl.textContent = "正在加载加密包…";
+  const keyPromise = derive(pass, MASTER_SALT);
+  let raw;
+  try {
+    raw = await loadPayload(force);
+  } catch (err) {
+    showLoadError();
+    return;
+  }
+  msgEl.textContent = "正在解密…";
+  try {
+    let key = await keyPromise;
+    const fileSalt = raw.slice(0, 16);
+    if (!sameBytes(fileSalt, MASTER_SALT)) key = await derive(pass, fileSalt);
+    await finish(raw, key, remember, true);
+  } catch (err) {
+    msgEl.textContent = "口令不对";
+    busy = false;
+    openBtn.disabled = false;
+  }
+}
+async function openSaved(saved, force) {
+  busy = true;
+  openBtn.disabled = true;
+  retryBtn.hidden = true;
+  resumeSaved = saved;
+  msgEl.textContent = "正在加载加密包…";
+  let raw;
+  try {
+    raw = await loadPayload(force);
+  } catch (err) {
+    showLoadError();
+    return;
+  }
+  msgEl.textContent = "正在解密…";
+  try {
+    const key = await crypto.subtle.importKey("raw", unb64(saved.encoded), { name: "AES-GCM" }, true, ["decrypt"]);
+    await finish(raw, key, saved.remember, saved.remember);
+  } catch (err) {
+    clearSaved();
+    busy = false;
+    openBtn.disabled = false;
+    msgEl.textContent = "需要重新输入口令";
+  }
+}
+
+try {
+  rememberEl.checked = localStorage.getItem(REMEMBER_FLAG) === "1";
+} catch (err) { /* 默认不勾 */ }
+// 预取失败先吞掉，避免没有 await 时变成未处理拒绝。点「打开」会再请求，并给出中文错误。
+loadPayload(false).catch(() => {});
+const savedOnOpen = readSaved();
+if (savedOnOpen) openSaved(savedOnOpen, false);
 </script>
 </body>
 </html>
