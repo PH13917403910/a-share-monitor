@@ -23,6 +23,39 @@
   .remember { display: flex; align-items: center; gap: 8px; color: #93a0b8; font-size: 14px; }
   .remember input { width: 18px; height: 18px; margin: 0; accent-color: #d7c4a3; }
   p { min-height: 1.4em; margin: 0; color: #e6c27a; }
+  .progress[hidden] { display: none; }
+  #bar { display: flex; gap: 4px; height: 10px; }
+  .seg {
+    flex: 1 1 0; min-width: 0; height: 100%; overflow: hidden;
+    background: #2c3548; border-radius: 999px;
+  }
+  .seg[hidden] { display: none; }
+  .fill { display: block; height: 100%; width: 0%; background: #d7c4a3; }
+  .seg.done .fill { width: 100%; }
+  .seg.active .fill { width: 100%; background: #f4e7c8; }
+  .seg.active.metered .fill { background: #d7c4a3; }
+  .seg.unknown .fill {
+    width: 38%; background: #d7c4a3;
+    animation: gate-progress 1.15s ease-in-out infinite;
+  }
+  @keyframes gate-progress {
+    0% { transform: translateX(-120%); }
+    100% { transform: translateX(280%); }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .seg.unknown .fill {
+      width: 100%; transform: none;
+      animation: gate-progress-fade 1.6s ease-in-out infinite;
+    }
+  }
+  @keyframes gate-progress-fade {
+    0%, 100% { opacity: 0.4; }
+    50% { opacity: 1; }
+  }
+  @media (forced-colors: active) {
+    .seg { background: Canvas; border: 1px solid CanvasText; }
+    .fill, .seg.active .fill, .seg.unknown .fill { background: Highlight; }
+  }
 </style>
 </head>
 <body>
@@ -33,6 +66,14 @@
   <button type="submit" id="open">打开</button>
   <button type="button" id="retry" class="ghost" hidden>重试</button>
   <p id="msg" role="status"></p>
+  <div id="progress" class="progress" hidden>
+    <div id="bar" role="progressbar" aria-labelledby="msg">
+      <span class="seg" data-stage="download" aria-hidden="true"><span class="fill"></span></span>
+      <span class="seg" data-stage="derive" aria-hidden="true"><span class="fill"></span></span>
+      <span class="seg" data-stage="decrypt" aria-hidden="true"><span class="fill"></span></span>
+      <span class="seg" data-stage="parse" aria-hidden="true"><span class="fill"></span></span>
+    </div>
+  </div>
 </form>
 <script>
 const ITERATIONS = 600000;
@@ -41,6 +82,15 @@ const DEVICE_KEY = "arisk-device-key";
 const REMEMBER_FLAG = "arisk-remember";
 const LOAD_FAIL = "加密包加载失败，请重试。不要在微信内置浏览器里打开这个页面。";
 const RETRIES = 2;
+const UNLOCK_PLAN = ["download", "derive", "decrypt", "parse"];
+const SAVED_PLAN = ["download", "decrypt", "parse"];
+const FETCH_PLAN = ["download"];
+const STAGE_TEXT = {
+  download: "正在加载加密包…",
+  derive: "正在派生密钥…",
+  decrypt: "正在解密…",
+  parse: "正在打开…",
+};
 
 function hexToBytes(hex) {
   const out = new Uint8Array(hex.length / 2);
@@ -56,10 +106,16 @@ const openBtn = document.getElementById("open");
 const retryBtn = document.getElementById("retry");
 const rememberEl = document.getElementById("remember");
 const msgEl = document.getElementById("msg");
+const progressEl = document.getElementById("progress");
+const barEl = document.getElementById("bar");
 
 let busy = false;
 let payloadTask = null;
+let payloadState = "idle";
+let loadGeneration = 0;
 let resumeSaved = null;
+let stagePlan = FETCH_PLAN.slice();
+const loadProgress = { phase: "idle", received: 0, total: null };
 
 function b64(bytes) {
   let s = "";
@@ -105,8 +161,11 @@ function onRetry() {
   busy = true;
   openBtn.disabled = true;
   retryBtn.hidden = true;
-  msgEl.textContent = "正在加载加密包…";
-  loadPayload(true).then(() => {
+  usePlan(FETCH_PLAN);
+  const task = loadPayload(true);
+  showStage("download");
+  task.then(() => {
+    hideProgress();
     msgEl.textContent = "加密包已就绪";
     busy = false;
     openBtn.disabled = false;
@@ -148,13 +207,70 @@ async function persist(key, remember, updateDevice) {
   } catch (err) { /* 记不住时仍可进入，本次会话用 sessionStorage */ }
 }
 async function finish(raw, key, remember, updateDevice) {
+  showStage("decrypt");
   const html = await decryptHtml(raw, key);
   try { await persist(key, remember, updateDevice); } catch (err) { /* 解密已成功，存储失败不挡进入 */ }
+  showStage("parse");
   document.open();
   document.write(html);
   document.close();
 }
-async function fetchOnce() {
+function byteLengthHeader(res) {
+  const encoding = (res.headers.get("content-encoding") || "").trim().toLowerCase();
+  if (encoding && encoding !== "identity") return null;
+  const header = res.headers.get("content-length");
+  if (!header) return null;
+  const n = Number(header);
+  if (!Number.isFinite(n) || n <= 0) return null;
+  return n;
+}
+function concatChunks(chunks, received) {
+  const raw = new Uint8Array(received);
+  let offset = 0;
+  for (let i = 0; i < chunks.length; i++) {
+    raw.set(chunks[i], offset);
+    offset += chunks[i].byteLength;
+  }
+  return raw;
+}
+function noteIfCurrent(generation, received, total) {
+  if (generation !== loadGeneration) return;
+  noteDownload(received, total);
+}
+async function readPayload(res, generation) {
+  const total = byteLengthHeader(res);
+  if (!res.body || typeof res.body.getReader !== "function") {
+    noteIfCurrent(generation, 0, total);
+    let buf;
+    try {
+      buf = await res.arrayBuffer();
+    } catch (err) {
+      throw new PayloadError("net");
+    }
+    const raw = new Uint8Array(buf);
+    noteIfCurrent(generation, raw.byteLength, total);
+    return raw;
+  }
+  const reader = res.body.getReader();
+  const chunks = [];
+  let received = 0;
+  noteIfCurrent(generation, 0, total);
+  try {
+    while (true) {
+      const step = await reader.read();
+      if (step.done) break;
+      if (!step.value || !step.value.byteLength) continue;
+      chunks.push(step.value);
+      received += step.value.byteLength;
+      noteIfCurrent(generation, received, total);
+    }
+  } catch (err) {
+    try { await reader.cancel(); } catch (ignore) { /* 连接已断 */ }
+    throw new PayloadError("net");
+  }
+  return concatChunks(chunks, received);
+}
+async function fetchOnce(generation) {
   let res;
   try {
     res = await fetch("./payload.enc", { cache: "no-store" });
@@ -162,21 +278,16 @@ async function fetchOnce() {
     throw new PayloadError("net");
   }
   if (!res.ok) throw new PayloadError("http");
-  let buf;
-  try {
-    buf = await res.arrayBuffer();
-  } catch (err) {
-    throw new PayloadError("net");
-  }
-  const raw = new Uint8Array(buf);
+  const raw = await readPayload(res, generation);
   if (raw.byteLength < 28) throw new PayloadError("short");
   return raw;
 }
-async function fetchPayload() {
+async function fetchPayload(generation) {
   let last = null;
   for (let attempt = 0; attempt <= RETRIES; attempt++) {
     try {
-      return await fetchOnce();
+      if (attempt > 0) noteIfCurrent(generation, 0, null);
+      return await fetchOnce(generation);
     } catch (err) {
       last = err;
       if (attempt < RETRIES) await sleep(400 * (attempt + 1));
@@ -187,10 +298,19 @@ async function fetchPayload() {
 }
 function loadPayload(force) {
   if (force || !payloadTask) {
-    const task = fetchPayload().then(
-      raw => raw,
+    const generation = ++loadGeneration;
+    payloadState = "loading";
+    noteDownload(0, null);
+    const task = fetchPayload(generation).then(
+      raw => {
+        if (generation === loadGeneration) payloadState = "ready";
+        return raw;
+      },
       err => {
-        if (payloadTask === task) payloadTask = null;
+        if (payloadTask === task) {
+          payloadTask = null;
+          if (generation === loadGeneration) payloadState = "error";
+        }
         throw err;
       }
     );
@@ -198,10 +318,122 @@ function loadPayload(force) {
   }
   return payloadTask;
 }
+async function loadShownPayload(force) {
+  if (!force && payloadState === "ready") return loadPayload(false);
+  const task = loadPayload(force);
+  showStage("download");
+  return task;
+}
+function downloadPercent(received, total) {
+  if (!(total > 0)) return null;
+  if (received >= total) return 100;
+  if (received <= 0) return 0;
+  return Math.floor((received / total) * 100);
+}
+function clearMeter() {
+  barEl.removeAttribute("aria-valuenow");
+  barEl.removeAttribute("aria-valuemin");
+  barEl.removeAttribute("aria-valuemax");
+  barEl.removeAttribute("aria-valuetext");
+}
+// 字节只在有 Content-Length 且未压缩时确定。派生、解密、打开无法计量，只跳步骤，不编百分比。
+function renderProgress() {
+  const phase = loadProgress.phase;
+  const current = stagePlan.indexOf(phase);
+  const active = current >= 0;
+  progressEl.hidden = !active;
+  const metered = phase === "download" && loadProgress.total > 0;
+  const unknown = phase === "download" && !(loadProgress.total > 0);
+  progressEl.classList.toggle("indeterminate", active && unknown);
+  const segs = barEl.querySelectorAll(".seg");
+  for (let i = 0; i < segs.length; i++) {
+    const seg = segs[i];
+    const index = stagePlan.indexOf(seg.getAttribute("data-stage"));
+    const fill = seg.querySelector(".fill");
+    seg.hidden = index < 0;
+    seg.classList.remove("done", "active", "metered", "unknown");
+    if (!active || index < 0) {
+      fill.style.width = "0%";
+      continue;
+    }
+    if (index < current) {
+      seg.classList.add("done");
+      fill.style.width = "100%";
+    } else if (index > current) {
+      fill.style.width = "0%";
+    } else if (unknown) {
+      seg.classList.add("active", "unknown");
+      fill.style.width = "";
+    } else if (metered) {
+      seg.classList.add("active", "metered");
+      fill.style.width = downloadPercent(loadProgress.received, loadProgress.total) + "%";
+    } else {
+      seg.classList.add("active");
+      fill.style.width = "100%";
+    }
+  }
+  if (!active) {
+    clearMeter();
+    return;
+  }
+  if (metered) {
+    const pct = downloadPercent(loadProgress.received, loadProgress.total);
+    barEl.setAttribute("aria-valuemin", "0");
+    barEl.setAttribute("aria-valuemax", "100");
+    barEl.setAttribute("aria-valuenow", String(pct));
+    barEl.setAttribute("aria-valuetext", "已下载 " + pct + "%");
+    return;
+  }
+  if (unknown) {
+    clearMeter();
+    barEl.setAttribute("aria-valuetext", "进行中");
+    return;
+  }
+  barEl.setAttribute("aria-valuemin", "1");
+  barEl.setAttribute("aria-valuemax", String(stagePlan.length));
+  barEl.setAttribute("aria-valuenow", String(current + 1));
+  barEl.setAttribute("aria-valuetext", "第 " + (current + 1) + " 步，共 " + stagePlan.length + " 步");
+}
+function noteDownload(received, total) {
+  loadProgress.received = received;
+  loadProgress.total = total;
+  if (loadProgress.phase === "download") renderProgress();
+}
+function usePlan(plan) {
+  stagePlan = plan.slice();
+}
+function showStage(phase) {
+  if (!stagePlan.includes(phase)) stagePlan = stagePlan.concat(phase);
+  loadProgress.phase = phase;
+  const text = STAGE_TEXT[phase];
+  if (text) msgEl.textContent = text;
+  form.setAttribute("aria-busy", "true");
+  renderProgress();
+}
+function hideProgress() {
+  loadProgress.phase = "idle";
+  form.setAttribute("aria-busy", "false");
+  renderProgress();
+}
+async function keyAfterDownload(keyPromise) {
+  let done = false;
+  let value;
+  let failure;
+  const tracked = keyPromise.then(
+    key => { done = true; value = key; },
+    err => { done = true; failure = err; }
+  );
+  await Promise.race([tracked, Promise.resolve()]);
+  if (!done) showStage("derive");
+  await tracked;
+  if (failure) throw failure;
+  return value;
+}
 function showLoadError() {
   busy = false;
   openBtn.disabled = false;
   retryBtn.hidden = false;
+  hideProgress();
   msgEl.textContent = LOAD_FAIL;
 }
 function clearSaved() {
@@ -229,22 +461,25 @@ async function unlock(pass, remember, force) {
   busy = true;
   openBtn.disabled = true;
   retryBtn.hidden = true;
-  msgEl.textContent = "正在加载加密包…";
+  usePlan(UNLOCK_PLAN);
   const keyPromise = derive(pass, MASTER_SALT);
   let raw;
   try {
-    raw = await loadPayload(force);
+    raw = await loadShownPayload(force);
   } catch (err) {
     showLoadError();
     return;
   }
-  msgEl.textContent = "正在解密…";
   try {
-    let key = await keyPromise;
+    let key = await keyAfterDownload(keyPromise);
     const fileSalt = raw.slice(0, 16);
-    if (!sameBytes(fileSalt, MASTER_SALT)) key = await derive(pass, fileSalt);
+    if (!sameBytes(fileSalt, MASTER_SALT)) {
+      showStage("derive");
+      key = await derive(pass, fileSalt);
+    }
     await finish(raw, key, remember, true);
   } catch (err) {
+    hideProgress();
     msgEl.textContent = "口令不对";
     busy = false;
     openBtn.disabled = false;
@@ -255,19 +490,20 @@ async function openSaved(saved, force) {
   openBtn.disabled = true;
   retryBtn.hidden = true;
   resumeSaved = saved;
-  msgEl.textContent = "正在加载加密包…";
+  usePlan(SAVED_PLAN);
   let raw;
   try {
-    raw = await loadPayload(force);
+    raw = await loadShownPayload(force);
   } catch (err) {
     showLoadError();
     return;
   }
-  msgEl.textContent = "正在解密…";
   try {
+    showStage("decrypt");
     const key = await crypto.subtle.importKey("raw", unb64(saved.encoded), { name: "AES-GCM" }, true, ["decrypt"]);
     await finish(raw, key, saved.remember, saved.remember);
   } catch (err) {
+    hideProgress();
     clearSaved();
     busy = false;
     openBtn.disabled = false;
